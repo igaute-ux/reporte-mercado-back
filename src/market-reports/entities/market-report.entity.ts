@@ -37,7 +37,4 @@ export class MarketReport {
 
   @Column({ nullable: true })
   movement: string; // Ej: 走5板, 清, 不动, 剩8板
-
-  @Column({ nullable: true })
-  notes: string; // comentarios adicionales si hay
 }

@@ -153,11 +153,17 @@ export class MarketReportsService {
     );
   
     if (dtos.length === 0) {
+      // ✅ Si el mensaje es ignorado, no lo guardamos en FailedReport
+      if (this.isIgnorableFailedMessage(message)) {
+        this.logger.warn(`⚠️ Ignorado (no se guarda en FailedReport): ${message}`);
+        return [];
+      }
+    
       this.logger.warn(`⚠️ No se guardó nada para: ${message}`);
-      // 👇 Guardamos en tabla de fallidos
       await this.failedRepository.save({ rawMessage: message });
       return [];
     }
+    
   
     this.logger.debug(`📥 Se van a guardar ${dtos.length} registros`);
     const reports = this.reportRepository.create(dtos);
@@ -168,13 +174,12 @@ export class MarketReportsService {
   // 🧪 PARSER PRINCIPAL
   // ============================================================
   private parseMessageToReports(message: string): CreateMarketReportDto[] {
-    
     const reports: CreateMarketReportDto[] = [];
     const clean = this.normalizeLine(message);
-    
+  
     this.logger.debug(`🧪 Analizando mensaje: ${clean}`);
-
-    // 🧩 Detectar si es reporte de cerezas
+  
+    // 🧩 Detectar si es reporte de cerezas 🍒
     if (this.isCherryReport(clean)) {
       const dateMatch = clean.match(/\d{4}[-/]\d{1,2}[-/]\d{1,2}/);
       const date = dateMatch ? dateMatch[0].replace(/\//g, '-') : new Date().toISOString().slice(0, 10);
@@ -192,23 +197,45 @@ export class MarketReportsService {
       return reports;
     }
   
-    // 🟢 Detectar si es reporte de uvas
+    // 🫐 Detectar si es reporte de berries (Ventura, Magica, Sekoya Pop, etc.)
+    if (this.isBerriesReport(clean)) {
+      const dateMatch = clean.match(/\d{4}[-/]\d{1,2}[-/]\d{1,2}/);
+      const date = dateMatch ? dateMatch[0].replace(/\//g, '-') : new Date().toISOString().slice(0, 10);
+  
+      const lines = clean
+        .split('\n')
+        .map((l) => this.normalizeLine(l))
+        .filter((l) => l && !/行情|早上|整体|价格区间/.test(l));
+  
+      for (const line of lines) {
+        const berries = this.parseBerriesLine(line, date);
+        if (berries.length > 0) reports.push(...berries);
+      }
+  
+      return reports;
+    }
+  
+    // 🍇 Detectar si es reporte de uvas
     if (this.isFruitLine(clean)) {
       const dateMatch = clean.match(/\d{4}[-/]\d{1,2}[-/]\d{1,2}/);
       const date = dateMatch
         ? dateMatch[0].replace(/\//g, '-')
         : new Date().toISOString().slice(0, 10);
-    
+  
       return this.parseGrapesLine(clean, date);
     }
-    
   
-    // 🟧 Si no es cherry ni grape → usar parsers existentes
+    // 🟧 Si no es cherry, berries ni grape → usar parsers existentes
     const type = this.detectMessageType(clean);
     if (type === 'long') return this.parseLongMessage(clean);
     if (type === 'short') return this.parseShortMessage(clean);
     return [];
   }
+  private isBerriesReport(message: string): boolean {
+    // Reconoce variedades comunes de arándanos / berries
+    return /(VENTURA|MAGICA|SEKOYA\s?POP|ATLAS|MISS\s?O|RED\s?CROWN|AG2)/i.test(message);
+  }
+  
 
   private detectMessageType(msg: string): 'long' | 'short' | 'unknown' {
     if (/^\d{4}[-\/]\d{1,2}[-\/]\d{1,2}/.test(msg)) return 'long';
@@ -246,6 +273,118 @@ export class MarketReportsService {
     return m ? m[1] : null;
   }
 
+  private parseBerriesLine(line: string, date: string): CreateMarketReportDto[] {
+    const dtos: CreateMarketReportDto[] = [];
+  
+    // 🧹 Normalizar
+    line = line
+      .replace(/^\d{4}-\d{1,2}-\d{1,2},?/, '')
+      .replace(/[，]/g, ',')
+      .replace(/–|－|—/g, '-')
+      .trim();
+  
+    // 🚚 Movimiento
+    const movement = this.extractMovement(line);
+    line = line.replace(/(走半柜|走\d+[Pp板]?|剩\d+[Pp板]?|清|没动|不动|部分代卖|部分自用|进渠道|为平台销售价)/g, '').trim();
+  
+    // 🪪 Tokens
+    const tokens = line.split('/').filter(Boolean);
+    if (tokens.length < 5) return [];
+  
+    // 🇨🇳 Exportador chino (solo nota)
+    const exporterCn = tokens[0];
+  
+    // 🏭 Exportador comercial
+    const exporter = tokens[2];
+  
+    // 🍓 Variedad
+    const variety = tokens[3];
+  
+    // 🍇 Item → viene del header
+    const item = this.lastItem ? this.mapItem(this.lastItem) : 'Blueberry';
+  
+    // 📦 Packaging
+    const packagingToken = tokens.find(t => /\d+(?:[.,]\d+)?KG/i.test(t)) ?? '';
+    let packaging: string | undefined;
+    let weight: string | undefined;
+    if (packagingToken) {
+      const match = packagingToken.match(/^(\d+(?:[.,]\d+)?)(KG)$/i);
+      if (match) {
+        packaging = match[1].replace(',', '.');
+        weight = match[2].toUpperCase();
+      }
+    }
+  
+    // 🌍 Origen (del header)
+    let origin = this.lastOrigin ? this.mapOrigin(this.lastOrigin) : undefined;
+    origin = origin ?? 'Chile';
+  
+    // 🪜 Tail
+    const afterPackIndex = packagingToken ? tokens.indexOf(packagingToken) + 1 : tokens.length;
+    const tail = tokens.slice(afterPackIndex).join('/');
+    const normalizedTail = tail
+      .replace(/\s+/g, '')
+      .replace(/\/{2,}/g, '/')
+      .trim();
+  
+    this.logger.debug(`🐛 Tokens: ${JSON.stringify(tokens)}`);
+    this.logger.debug(`📦 Packaging token: ${packagingToken}`);
+    this.logger.debug(`🐍 Tail normalizado: ${normalizedTail}`);
+  
+    // 📏 Calibre y precio
+    const calibreRegex = /(\d{1,2}\+|[JX]{1,3})\/(\d+(?:-\d+)?)/g;
+    let match: RegExpExecArray | null;
+  
+    while ((match = calibreRegex.exec(normalizedTail)) !== null) {
+      const calibre = match[1];
+      const prices = match[2]
+        .split(/[,，-]/)
+        .map((p) => Number(p.trim()))
+        .filter((n) => !isNaN(n));
+  
+      for (const price of prices) {
+        dtos.push({
+          date,
+          market: 'SH',
+          origin,
+          item,           // ✅ viene del header (ej. Blueberry)
+          exporter,       // ✅ Red Crown
+          variety,        // ✅ Ventura
+          packaging,
+          weight,
+          size: calibre,
+          price,
+          movement,
+          notes: `Exportador CN: ${exporterCn}`,
+        });
+      }
+    }
+  
+    // 📏 Fallback: precio sin calibre
+    if (dtos.length === 0 && /^\d+(?:-\d+)?$/.test(normalizedTail)) {
+      const [p1, p2] = normalizedTail.split('-').map(Number);
+      const prices = p2 ? [p1, p2] : [p1];
+      for (const price of prices) {
+        dtos.push({
+          date,
+          market: 'SH',
+          origin,
+          item,
+          exporter,
+          variety,
+          packaging,
+          weight,
+          size: 'NS',
+          price,
+          movement,
+          notes: `Exportador CN: ${exporterCn}`,
+        });
+      }
+    }
+  
+    return dtos;
+  }
+  
   // ============================================================
   // 🟩 GROUP 1 PARSER
   // ============================================================
@@ -421,28 +560,36 @@ if (packagingToken) {
 
 
     // 🧹 Limpiar variedad y packaging antes de regex
-    const cleanedSegment = segment
-      .replace(variety, '')
-      .replace(packagingToken, '')
-      .trim();
+    let cleanedSegment = segment
+    .replace(variety, '')
+    .replace(packagingToken, '')
+    .replace(/[,，]+$/, '')         // 🧹 quita comas finales
+    .replace(/\/+$/, '')           // 🧹 quita slashes finales
+    .trim();
+  
 
     // 📏 Regex estricta para calibres y precios
-    const sizePriceRegex = /\b(\d{0,2}J[D]?)\s*(\d+(?:-\d+)?)?\b/gi;
+// 📏 Regex mejorado: soporta 4J1099, 2J/899, J/799, etc.
+// 📏 Regex más robusta: captura también "4J1099" y "4J 1099"
+const sizePriceRegex = /(\d{0,2}J[D]?)[\/\s]?(\d+(?:-\d+)?)/gi;
 
 
-    const calibres: string[] = [];
-    const precios: number[] = [];
-    
-    let m: RegExpExecArray | null;
-    while ((m = sizePriceRegex.exec(cleanedSegment)) !== null) {
-      const calibre = m[1];
-      const precio = m[2] ? Number(m[2].split('-').pop()) : undefined;
-    
-      if (calibre && /^(\d{0,2}J[D]?)$/i.test(calibre)) {
-        calibres.push(calibre);
-        if (precio !== undefined) precios.push(precio);
-      }
-    }
+
+
+const calibres: string[] = [];
+const precios: number[] = [];
+
+let m: RegExpExecArray | null;
+while ((m = sizePriceRegex.exec(cleanedSegment)) !== null) {
+  const calibre = m[1];
+  const precio = m[2] ? Number(m[2]) : undefined;
+
+  if (calibre && precio !== undefined) {
+    calibres.push(calibre);
+    precios.push(precio);
+  }
+}
+
     
     // Si hay un solo precio pero varios calibres, lo duplicamos
     if (precios.length === 1 && calibres.length > 1) {
@@ -466,7 +613,9 @@ if (packagingToken) {
     // 👇 Fallback si sigue vacío (por ejemplo, para mensajes sueltos sin encabezado)
     origin = origin ?? 'Chile';
     
-    
+    this.logger.debug(`✅ Calibres: ${JSON.stringify(calibres)}`);
+this.logger.debug(`✅ Precios: ${JSON.stringify(precios)}`);
+
     // 📝 Generar filas por cada calibre
     for (let i = 0; i < calibres.length; i++) {
       dtos.push({
@@ -491,6 +640,36 @@ if (packagingToken) {
 }
 // ... (todo tu código original arriba sin cambios)
 
+private isIgnorableFailedMessage(message: string): boolean {
+  const clean = this.normalizeLine(message);
+
+  // 🧭 1. Mensajes tipo "162/OTPU6165837" (solo container ID)
+  if (/^\d{1,3}\/[A-Z0-9]+$/.test(clean.replace(/^\d{4}-\d{1,2}-\d{1,2},?/, '').trim())) {
+    return true;
+  }
+
+  // 🧭 2. Mensajes con solo container ID sin variedad/exportador
+  if (/^[A-Z0-9]+$/.test(clean.replace(/^\d{4}-\d{1,2}-\d{1,2},?/, '').trim())) {
+    return true;
+  }
+
+  // 🧭 3. Líneas con KG pero sin variedad/exportador → ej. "5KG/JD/100-110"
+  if (/^\d+KG\//i.test(clean) && !/(REGINA|VENTURA|MAGICA|KORDIA|RED|BLUE|GLOBE|SWEET)/i.test(clean)) {
+    return true;
+  }
+
+  // 🧭 4. Líneas con solo calibres y precios
+  if (/^\d+KG\/[A-Z0-9]+\/\d+/.test(clean) && !/[a-zA-Z\u4e00-\u9fa5]+/.test(clean.split('/')[0])) {
+    return true;
+  }
+
+  // 🧭 5. Líneas con solo texto suelto tipo "中新/C"
+  if (/^[\u4e00-\u9fa5A-Za-z]+\/[A-Z]+$/i.test(clean.replace(/^\d{4}-\d{1,2}-\d{1,2},?/, '').trim())) {
+    return true;
+  }
+
+  return false;
+}
 
 
 private isFruitLine(line: string): boolean {
