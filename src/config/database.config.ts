@@ -1,10 +1,12 @@
 import { registerAs } from '@nestjs/config';
-import { type TypeOrmModuleOptions } from '@nestjs/typeorm';
+import { TypeOrmModuleOptions } from '@nestjs/typeorm';
 
 export default registerAs(
   'database',
-  () =>
-    ({
+  (): TypeOrmModuleOptions => {
+    const isProduction = process.env.NODE_ENV === 'production';
+
+    return {
       type: 'postgres',
       host: process.env.POSTGRES_HOST || '',
       port: parseInt(process.env.POSTGRES_PORT as string, 10) || 5432,
@@ -16,5 +18,9 @@ export default registerAs(
       logging: false,
       migrations: [`${__dirname}/../../db/migrations/*{.ts,.js}`],
       migrationsTableName: 'migrations',
-    }) as TypeOrmModuleOptions,
+      ssl: !isProduction
+        ? { rejectUnauthorized: false } // si estás en local
+        : false,                        // Railway interno no necesita ssl
+    };
+  },
 );
